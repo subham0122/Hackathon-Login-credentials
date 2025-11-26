@@ -1,8 +1,10 @@
 import os
 from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from typing import Optional
 
 # Load environment variables
 load_dotenv()
@@ -18,6 +20,15 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(title="Authentication Microservice")
 
+# Add CORS middleware for Next.js frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Pydantic Models
 class UserSignup(BaseModel):
     email: str
@@ -27,11 +38,98 @@ class UserLogin(BaseModel):
     email: str
     password: str
 
+class GoogleAuthVerify(BaseModel):
+    access_token: Optional[str] = None
+    code: Optional[str] = None
+
+# Helper Functions / Dependencies
+def verify_jwt_token(authorization: str = Header(None)):
+    """Dependency to verify JWT token and return user"""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization header format")
+    
+    token = authorization.split(" ")[1]
+    
+    try:
+        user = supabase.auth.get_user(token)
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return user
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
 # Endpoints
 
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+@app.get("/home")
+def home():
+    """Public endpoint - no authentication required"""
+    return {
+        "message": "Welcome to the home page!",
+        "description": "This is a public endpoint accessible to everyone."
+    }
+
+@app.get("/service")
+def service(user = Depends(verify_jwt_token)):
+    """Protected endpoint - requires valid JWT"""
+    return {
+        "message": f"Welcome to the service page, {user.user.email}!",
+        "description": "This is a protected endpoint. You are authenticated.",
+        "user_id": user.user.id
+    }
+
+@app.post("/login/google")
+def login_google():
+    """Initiate Google OAuth flow - returns OAuth URL"""
+    try:
+        response = supabase.auth.sign_in_with_oauth({
+            "provider": "google",
+            "options": {
+                "redirect_to": "http://localhost:3000/auth/callback",
+                "skip_browser_redirect": True  # Return URL instead of redirecting
+            }
+        })
+        return {
+            "url": response.url,
+            "message": "Open this URL in browser to authenticate with Google"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OAuth initiation failed: {str(e)}")
+
+@app.post("/auth/google/verify")
+def verify_google_auth(auth_data: GoogleAuthVerify):
+    """Verify Google OAuth access token"""
+    try:
+        if auth_data.access_token:
+            # Validate the access token with Supabase
+            # The token should already be a valid Supabase JWT from the OAuth flow
+            try:
+                user = supabase.auth.get_user(auth_data.access_token)
+                if user and user.user:
+                    return {
+                        "access_token": auth_data.access_token,
+                        "token_type": "bearer",
+                        "user": {
+                            "id": user.user.id,
+                            "email": user.user.email
+                        }
+                    }
+            except Exception as e:
+                print(f"Token validation failed: {str(e)}")
+                raise HTTPException(status_code=401, detail="Invalid access token")
+        else:
+            raise HTTPException(status_code=400, detail="access_token is required")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in verify_google_auth: {type(e).__name__}: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Google auth verification failed: {str(e)}")
 
 @app.post("/signup")
 def signup(user: UserSignup):
